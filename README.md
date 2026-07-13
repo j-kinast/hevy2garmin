@@ -281,6 +281,20 @@ pip install hevy2garmin[cloud]
 
 This adds `psycopg2-binary` and enables automatic Postgres backend detection via `DATABASE_URL`.
 
+### TypeScript / npm
+
+The same logic is available as a TypeScript package for Node, serverless functions, and Vercel crons, so you can run the sync without a Python runtime.
+
+```bash
+npm install hevy2garmin
+```
+
+```ts
+import { generateFit, HevyClient } from "hevy2garmin";
+```
+
+It lives alongside the Python package in the [`typescript/`](typescript) folder of this repo and is published to npm under the same name. Setup, the full API, and examples are in the [TypeScript README](typescript/README.md). The Python package on PyPI stays fully supported.
+
 ## Getting Your Hevy API Key
 
 > **Hevy Pro is required.** API access is not available on the free plan.

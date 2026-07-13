@@ -6,6 +6,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.17] - 2026-07-13
+
+### Fixed
+- The "Not configured" error is now context-aware. On the cloud / GitHub Actions path (DATABASE_URL set) it no longer tells you to run `hevy2garmin init` (a local interactive wizard that can't run in Actions); instead it points you to finish setup in the dashboard and to make sure `DATABASE_URL` matches your deployment's database. (#224)
+
+## [0.5.16] - 2026-07-13
+
+### Fixed
+- Merge mode: when Garmin rejects one exercise's name as an invalid sub-category, only that exercise's name is now stripped instead of every name in the workout. The offender is found by bisecting the payload (the atomic PUT gives no per-exercise error), so the rest of your exercises keep their real names. Falls back to stripping all names only if several exercises are rejected. (#222)
+
 ## [0.5.15] - 2026-07-10
 
 ### Changed

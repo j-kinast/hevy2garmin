@@ -13,10 +13,30 @@ from hevy2garmin.mapper import save_custom_mapping
 from hevy2garmin.sync import sync
 
 
+def _not_configured_message() -> str:
+    """Context-aware 'not configured' guidance. On the cloud/Actions path
+    (DATABASE_URL set) 'hevy2garmin init' is the wrong advice — the real fix is
+    the dashboard setup + a matching DATABASE_URL."""
+    from hevy2garmin.db import get_database_url
+
+    if get_database_url():
+        return (
+            "✗ Not configured: no Hevy/Garmin credentials found in the database.\n"
+            "  Finish setup in your deployed dashboard (add your Hevy API key and connect\n"
+            "  Garmin), and make sure the DATABASE_URL here is the SAME database your\n"
+            "  deployment uses (check the GitHub secret matches your Vercel env var)."
+        )
+    return (
+        "✗ Not configured. On GitHub Actions / cloud, set the DATABASE_URL secret to your\n"
+        "  deployment's database (the same Neon URL your dashboard uses). Running locally?\n"
+        "  Run: hevy2garmin init"
+    )
+
+
 def _require_config(args: argparse.Namespace) -> None:
     """Check config exists, error if not (unless credentials passed via flags)."""
     if not is_configured() and not args.hevy_api_key:
-        print("✗ Not configured. Run: hevy2garmin init")
+        print(_not_configured_message())
         sys.exit(1)
 
 
@@ -115,7 +135,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
 def cmd_status(args: argparse.Namespace) -> None:
     """Show sync status."""
     if not is_configured():
-        print("✗ Not configured. Run: hevy2garmin init")
+        print(_not_configured_message())
         sys.exit(1)
 
     count = db.get_synced_count()

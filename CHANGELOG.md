@@ -6,6 +6,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- The watch-activity **Replace** strategy now extracts high-resolution heart-rate samples from the original Garmin FIT and embeds them in the named Hevy replacement before deleting the watch copy. If the source cannot be extracted or restored from backup, replacement stops and preserves the original activity.
+
+## [0.5.19] - 2026-07-14
+
+### Added
+- Safe Garmin upload recovery ([#227](https://github.com/drkostas/hevy2garmin/pull/227), thanks @donndonn). Uploads that fail mid-request (crash/timeout) are parked in a durable `pending_uploads` table instead of being blindly re-uploaded, so an upload that may have reached Garmin never creates a duplicate. Rename/description/watch-delete resume from checkpoints, same-id deletion is blocked, and delete retries are capped. New CLI and web controls to resolve stuck syncs: reconcile (never uploads, adopts an activity only with a start-time match and upload evidence), retry-failed-only, abandon, mark-synced, and skip.
+
+## [0.5.18] - 2026-07-14
+
+### Fixed
+- Python 3.10 compatibility: timestamps with a single fractional-second digit (e.g. `2026-03-15T18:02:00.0`) or a space date/time separator no longer raise `ValueError` on Python 3.10, which the project supports. All ISO-8601 parsing now goes through a shared `parse_iso()` helper that normalizes the fraction width and the `Z`/space separators (previously 15 `datetime.fromisoformat` call sites could fail on 3.10 for such timestamps). (#229)
+
 ## [0.5.17] - 2026-07-13
 
 ### Fixed

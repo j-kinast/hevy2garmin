@@ -6,6 +6,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.21] - 2026-07-19
+
+### Fixed
+- The **Replace** watch strategy no longer aborts the whole sync when the watch's high-resolution HR cannot be extracted (a 0.5.20 regression, [#244](https://github.com/drkostas/hevy2garmin/issues/244)). It now keeps the watch activity and merges the sets into it in place, so the workout still syncs and the watch HR is never lost. Only the named-exercise display is dropped when the HR cannot be preserved. HR extraction also tolerates a small clock offset between the Hevy workout window and the watch recording.
+
 ## [0.5.20] - 2026-07-18
 
 ### Added

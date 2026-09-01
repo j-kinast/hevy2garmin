@@ -33,6 +33,22 @@ def get_client(
     Uses DBTokenStore when DATABASE_URL is set (cloud/Vercel),
     falls back to file-based tokens (local/Docker).
     """
+    auth = GarminAuth(**auth_kwargs(email, password, token_dir))
+    return auth.login()
+
+
+def auth_kwargs(
+    email: str | None = None,
+    password: str | None = None,
+    token_dir: str = "~/.garminconnect",
+) -> dict:
+    """Build the GarminAuth kwargs selecting the right token store.
+
+    Every path that authenticates with Garmin must agree on where tokens
+    live, or one writes a store the other never reads and the account looks
+    permanently un-authenticated. Shared by get_client and the dashboard's
+    direct login so the choice is made in exactly one place.
+    """
     from hevy2garmin.db import get_database_url
     database_url = get_database_url()
 
@@ -44,9 +60,7 @@ def get_client(
         kwargs["token_dir"] = "/tmp/.garminconnect"
     else:
         kwargs["token_dir"] = token_dir
-
-    auth = GarminAuth(**kwargs)
-    return auth.login()
+    return kwargs
 
 
 def _sanitize_activity_id(raw: object) -> int | None:
@@ -84,7 +98,8 @@ def upload_fit(
         fit_path: Path to the .fit file.
         workout_start: ISO-8601 start time for matching the uploaded activity.
         exclude_activity_ids: Activities that existed before the upload. These
-            must not be mistaken for the newly imported activity.
+            must not be mistaken for the newly imported activity — not even
+            when Garmin names one of them in the import result itself.
 
     Returns dict with upload_id and activity_id (if found).
     """
@@ -127,6 +142,22 @@ def upload_fit(
         logger.info("  Upload result: upload_id=%s activity_id=%s", upload_id, activity_id)
     else:
         logger.info("  Upload response: %s", str(resp)[:200])
+
+    # A pre-existing activity must never be taken for the new one, even when
+    # Garmin reports it as the import "success". Under the "replace" strategy
+    # the watch copy shares the workout's start time, so Garmin can answer the
+    # import with that id instead of creating a new activity — the caller then
+    # deletes the watch copy and renames an activity that is already gone
+    # (404). Drop the echoed id and fall through to the start-time lookup.
+    if activity_id is not None and exclude_activity_ids:
+        excluded = {str(x) for x in exclude_activity_ids}
+        if str(activity_id) in excluded:
+            logger.warning(
+                "  Import result returned excluded activity %s (pre-existing duplicate); "
+                "resolving the new activity by start time instead",
+                activity_id,
+            )
+            activity_id = None
 
     # Find the activity ID for renaming (retry with backoff if needed).
     # Only match by start time — never grab "most recent activity" because
@@ -421,7 +452,14 @@ def create_workout(client: Garmin, payload: dict) -> int | None:
 
 
 def list_workouts(client: Garmin, limit: int = 100) -> list[dict]:
-    """List the user's saved Garmin workouts (for idempotency / reconciliation)."""
+    """List the user's saved Garmin workouts (for idempotency / reconciliation).
+
+    Raises on a non-list 2xx body (an error envelope or a shape drift) so callers
+    treat it as "unknown" rather than an empty library. Reading an error-as-200 as
+    ``[]`` would make routine reconciliation flag every synced routine as deleted on
+    Garmin. Both callers wrap this in a best-effort try/except, so a raise degrades
+    to the last-known DB state instead of acting on a false empty listing.
+    """
     time.sleep(1.0)  # manual rate limit
     resp = client.client.request(
         "GET",
@@ -429,7 +467,12 @@ def list_workouts(client: Garmin, limit: int = 100) -> list[dict]:
         f"/workout-service/workouts?start=1&limit={limit}&myWorkoutsOnly=true",
     )
     data = resp.json() if hasattr(resp, "json") else resp
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"Garmin workout listing returned a {type(data).__name__}, not a list; "
+            "treating as unknown rather than empty"
+        )
+    return data
 
 
 def delete_workout(client: Garmin, workout_id: int | str) -> None:
@@ -441,16 +484,36 @@ def delete_workout(client: Garmin, workout_id: int | str) -> None:
     logger.info("  Deleted Garmin workout %s", workout_id)
 
 
-def schedule_workout(client: Garmin, workout_id: int | str, date: str) -> None:
-    """Schedule a saved Garmin workout onto the calendar for ``date`` (YYYY-MM-DD)."""
+def schedule_workout(client: Garmin, workout_id: int | str, date: str) -> int | None:
+    """Schedule a saved Garmin workout onto the calendar for ``date`` (YYYY-MM-DD).
+
+    Returns the ``workoutScheduleId`` Garmin assigns to the new calendar entry so
+    the caller can track and later unschedule it (Garmin appends a fresh entry on
+    every POST — it does not dedup server-side). Returns ``None`` if the response
+    carries no parseable id, so scheduling still succeeds even if the shape drifts.
+    """
     time.sleep(1.0)  # manual rate limit
-    client.client.request(
+    resp = client.client.request(
         "POST",
         "connectapi",
         f"/workout-service/schedule/{workout_id}",
         json={"date": date},
     )
     logger.info("  Scheduled Garmin workout %s for %s", workout_id, date)
+    try:
+        data = resp.json() if hasattr(resp, "json") else resp
+        return data.get("workoutScheduleId") if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def unschedule_workout(client: Garmin, scheduled_id: int | str) -> None:
+    """Remove a calendar entry (``workoutScheduleId``) without deleting the workout."""
+    time.sleep(1.0)  # manual rate limit
+    client.client.request(
+        "DELETE", "connectapi", f"/workout-service/schedule/{scheduled_id}"
+    )
+    logger.info("  Unscheduled Garmin calendar entry %s", scheduled_id)
 
 
 def generate_description(workout: dict, calories: int | None = None, avg_hr: int | None = None) -> str:
@@ -505,8 +568,14 @@ def generate_description(workout: dict, calories: int | None = None, avg_hr: int
                         parts.append(f"{int(total_dur // 60)}min")
                     lines.append(f"• {name}: {' · '.join(parts)}")
                 else:
-                    weights = [s.get("weight_kg") or s.get("weight", 0) for s in normal]
-                    reps = [s.get("reps", 0) for s in normal]
+                    weights = [
+                        w for s in normal
+                        if (w := (s.get("weight_kg") or s.get("weight"))) is not None
+                    ]
+                    reps = [
+                        r for s in normal
+                        if (r := s.get("reps")) is not None
+                    ]
                     top_weight = max(weights) if weights else 0
                     top_reps = max(reps) if reps else 0
                     lines.append(f"• {name}: {len(normal)} {n_label} · {top_weight:.1f}kg × {top_reps}")

@@ -41,6 +41,34 @@ def _require_config(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _garmin_interactive_login(email: str, password: str) -> None:
+    """Two-step Garmin login for the terminal; prints status, never raises."""
+    from hevy2garmin import garmin_login
+
+    result = garmin_login.begin(email, password)
+    if result["status"] == "needs_mfa":
+        try:
+            code = input("  Garmin sent a verification code — enter it: ").strip()
+        except EOFError:
+            print("✗ No input available — cannot complete MFA.")
+            return
+        result = garmin_login.complete(result["session_id"], code)
+
+    status = result["status"]
+    if status == "success":
+        print(f"✓ Authenticated as {result.get('display_name') or 'Garmin'}")
+    elif status == "invalid_credentials":
+        print("✗ Failed: check your Garmin email and password.")
+    elif status == "rate_limited":
+        print("✗ Garmin is rate-limiting logins from this server. Try again in 1–2 h.")
+    elif status == "mfa_failed":
+        print("✗ The verification code was rejected.")
+    elif status == "session_expired":
+        print("✗ Login session expired — run init again.")  # parity with HTTP surface; unreachable in CLI
+    else:
+        print(f"✗ Failed: {result.get('message', 'unknown error')}")
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     """Interactive setup wizard."""
     print("hevy2garmin setup\n")
@@ -76,16 +104,9 @@ def cmd_init(args: argparse.Namespace) -> None:
     if email:
         pw = getpass.getpass("Garmin password (enter to skip if tokens exist): ")
         if pw:
-            # Test login
-            print("  Checking Garmin login...", end=" ", flush=True)
-            try:
-                from garmin_auth import GarminAuth
-                auth = GarminAuth(email=email, password=pw)
-                client = auth.login()
-                print(f"✓ Authenticated as {client.display_name}")
-            except Exception as e:
-                print(f"✗ Failed: {e}")
-                print("  You can fix this later. Continuing setup...")
+            print("  Checking Garmin login...")
+            _garmin_interactive_login(email, pw)
+            # Login failures are non-fatal — tokens can be set up later.
 
     # User profile
     print("\nUser profile (for calorie estimation):")
@@ -348,6 +369,27 @@ def cmd_skip(args: argparse.Namespace) -> None:
     print(f"✓ Skipped {args.hevy_id}")
 
 
+def cmd_hash_password(args: argparse.Namespace) -> None:
+    """Generate an argon2 hash for the H2G_PASSWORD_HASH dashboard secret."""
+    import nacl.pwhash
+
+    pw = args.password
+    if not pw:
+        pw = getpass.getpass("Dashboard password: ")
+        if pw != getpass.getpass("Confirm password: "):
+            print("✗ Passwords do not match", file=sys.stderr)
+            sys.exit(1)
+    if not pw:
+        print("✗ Empty password", file=sys.stderr)
+        sys.exit(1)
+    print(nacl.pwhash.argon2id.str(pw.encode()).decode())
+    print(
+        "\nSet this value as H2G_PASSWORD_HASH (and leave H2G_PASSWORD unset) so the "
+        "plaintext password never lives in your environment.",
+        file=sys.stderr,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="hevy2garmin",
@@ -422,6 +464,11 @@ def main() -> None:
     serve_parser.add_argument("-p", "--port", type=int, default=8123, help="Port (default: 8123)")
     serve_parser.add_argument("--host", default="0.0.0.0", help="Host (default: 0.0.0.0)")
 
+    # hash-password
+    hashpw_parser = subparsers.add_parser(
+        "hash-password", help="Generate an argon2 hash for H2G_PASSWORD_HASH")
+    hashpw_parser.add_argument("password", nargs="?", help="Password (omit to be prompted securely)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -429,7 +476,10 @@ def main() -> None:
         sys.exit(0)
 
     level = logging.DEBUG if args.verbose else (logging.CRITICAL if args.quiet else logging.INFO)
-    logging.basicConfig(format="%(message)s", level=level, force=True)
+    logging.basicConfig(
+        format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+        level=level, force=True,
+    )
 
     try:
         if args.command == "serve":
@@ -452,6 +502,7 @@ def main() -> None:
             "abandon-pending": cmd_abandon_pending,
             "mark-synced": cmd_mark_synced,
             "skip": cmd_skip,
+            "hash-password": cmd_hash_password,
         }
         commands[args.command](args)
     except RuntimeError as e:

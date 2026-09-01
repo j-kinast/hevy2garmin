@@ -2,32 +2,141 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
+import hmac
 import logging
 import os
 import re
-import threading
-import time
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
+from html import escape
+from math import ceil
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader
 
-from hevy2garmin import db, __version__
+from hevy2garmin import autosync, db, garmin_login, login_ratelimit, syncstate, __version__
 from hevy2garmin.db_interface import NoWritableDatabaseError
-from hevy2garmin.auth import auth_enabled, verify_session, sign_session, check_password, SESSION_COOKIE
+from hevy2garmin.auth import (
+    auth_enabled, verify_session, sign_session, check_password, SESSION_COOKIE, session_ttl,
+)
 from hevy2garmin.config import is_configured, load_config, save_config
 from hevy2garmin.demo import is_demo_mode
 from hevy2garmin.ratelimit import record_rate_limit, cooldown_remaining, clear_rate_limit, format_cooldown
-from hevy2garmin.sync import sync, sync_routines, routine_schedule_dates, schedule_routine
+from hevy2garmin.sync import (
+    sync,
+    sync_routines,
+    sync_routine,
+    routine_schedule_dates,
+    schedule_routine,
+    unschedule_routine_entry,
+)
 
 logger = logging.getLogger("hevy2garmin")
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
+
+# Sub-path this app is served under when it sits behind a reverse proxy that
+# mounts it below the origin root (X-Forwarded-Prefix, e.g. "/apps/hevy2garmin").
+# Empty for a normal root install; set per request by the middleware.
+#
+# Every URL this app emits is root-absolute ("/workouts", "/api/sync-one"), which
+# is correct at the root and wrong one level down, so all three kinds are moved
+# onto the prefix: HTML attributes and redirect Locations server-side (below),
+# and the URLs the page's JavaScript builds at runtime via `window.APP_PREFIX`
+# (base.html). A proxy cannot fix the third kind, so the app has to own all of it.
+_url_prefix: contextvars.ContextVar[str] = contextvars.ContextVar("url_prefix", default="")
+
+# Root-absolute URL in an attribute that navigates or fetches. Deliberately not
+# every attribute: only these carry a URL the browser resolves against the origin.
+_ROOT_ABSOLUTE_ATTR = re.compile(
+    r'(\s(?:href|src|action|hx-get|hx-post|hx-put|hx-patch|hx-delete)=")/(?!/)'
+)
+
+# A prefix is a single-origin absolute path and nothing else. The character class
+# excludes ":" (no scheme), quotes and angle brackets (no breaking out of an
+# attribute or a script tag), and the explicit "//" rejection blocks a
+# protocol-relative value, which would silently re-point every URL on the page at
+# another host.
+_SAFE_PREFIX = re.compile(r"^/[A-Za-z0-9._~/-]+$")
+
+
+def trust_forwarded_prefix() -> bool:
+    """Whether X-Forwarded-Prefix may be believed.
+
+    Off by default, and that default is the security boundary: any client can
+    send the header, so on a directly-exposed instance — or one behind a proxy
+    that forwards client headers untouched — trusting it hands an attacker
+    control of every URL the page emits, including the login form's action and
+    the Garmin token POST. Only the operator knows a proxy is setting it.
+    """
+    return os.environ.get("H2G_TRUST_FORWARDED_PREFIX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _validated_prefix(raw: str) -> str:
+    """Normalize a claimed sub-path, or return "" if it is not one.
+
+    Rejecting outright rather than sanitizing: a prefix that needed cleaning was
+    not sent by the proxy this feature exists for, and serving the page at the
+    origin root is the safe fallback in every case.
+    """
+    candidate = (raw or "").strip().rstrip("/")
+    if not candidate or candidate.startswith("//") or not _SAFE_PREFIX.match(candidate):
+        return ""
+    return candidate
+
+
+def _apply_prefix(html: str, prefix: str) -> str:
+    """Move root-absolute URL attributes in ``html`` onto ``prefix``.
+
+    A no-op without a prefix, so a root install renders byte-identical HTML.
+    Rewriting the rendered output rather than the templates keeps the prefix out
+    of ~50 template call sites, where a single missed one is an unreachable page.
+    Already-prefixed URLs are left alone, so this stays safe to apply twice (a
+    proxy that does its own HTML rewriting may have got there first).
+    """
+    if not prefix:
+        return html
+
+    # Escaped even though _validated_prefix already excludes every character
+    # that matters here: this is the sink, and a sink that cannot be broken
+    # regardless of what reaches it does not depend on validation staying correct.
+    safe = escape(prefix, quote=True)
+
+    def _sub(m: re.Match[str]) -> str:
+        rest = html[m.end() - 1 :]
+        if rest == safe or rest.startswith((safe + "/", safe + '"', safe + "?")):
+            return m.group(0)
+        return f"{m.group(1)}{safe}/"
+
+    return _ROOT_ABSOLUTE_ATTR.sub(_sub, html)
+
+
+def _prefix_location(location: str, prefix: str) -> str:
+    """Move a root-relative redirect target onto ``prefix``; idempotent.
+
+    Both sides are checked for a protocol-relative form: a "//evil.example.com"
+    prefix would otherwise turn any internal redirect into an off-site one.
+    """
+    if not prefix or prefix.startswith("//"):
+        return location
+    if not location.startswith("/") or location.startswith("//"):
+        return location
+    if location == prefix or location.startswith((prefix + "/", prefix + "?")):
+        return location
+    return prefix + location
 
 
 def _get_cat_names() -> dict[int, str]:
@@ -47,15 +156,54 @@ def _get_cat_names() -> dict[int, str]:
 _jinja_env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), autoescape=True)
 
 
+# Weekday / short-date helpers for the routines "Upcoming schedule" timeline.
+_SCHED_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+_SCHED_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _sched_parts(iso: Any) -> dict[str, str]:
+    """Format an ISO date (YYYY-MM-DD) into {'short': 'Jul 24', 'weekday': 'Friday'}."""
+    try:
+        d = date.fromisoformat(str(iso)[:10])
+        return {"short": f"{_SCHED_MONTHS[d.month - 1]} {d.day}", "weekday": _SCHED_WEEKDAYS[d.weekday()]}
+    except (ValueError, TypeError):
+        return {"short": str(iso or ""), "weekday": ""}
+
+
+_jinja_env.globals["sched_parts"] = _sched_parts
+
+
 def _render(template_name: str, **ctx) -> HTMLResponse:
     t = _jinja_env.get_template(template_name)
     ctx.setdefault("auth_enabled", auth_enabled())
     ctx.setdefault("demo_mode", is_demo_mode())
     ctx.setdefault("version", __version__)
-    return HTMLResponse(t.render(**ctx))
+    prefix = _url_prefix.get()
+    ctx.setdefault("url_prefix", prefix)
+    return HTMLResponse(_apply_prefix(t.render(**ctx), prefix))
 
 
-app = FastAPI(title="hevy2garmin", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the auto-sync timer if configured, and cancel it on shutdown.
+
+    Scheduling and cancelling both live in :mod:`hevy2garmin.autosync`.
+    """
+    config = load_config()
+    auto_cfg = config.get("auto_sync", {})
+    if auto_cfg.get("enabled", False):
+        interval = auto_cfg.get("interval_minutes", 30)
+        logger.info("Auto-sync enabled on startup: every %d min", interval)
+        autosync.schedule(interval)
+    try:
+        yield
+    finally:
+        # Without this a pending timer survives reload/shutdown and can fire a
+        # sync against a half-torn-down process.
+        autosync.stop()
+
+
+app = FastAPI(title="hevy2garmin", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -90,36 +238,15 @@ async def _no_database_handler(request: Request, exc: NoWritableDatabaseError) -
     return HTMLResponse(_NO_DB_PAGE, status_code=503)
 
 
-# ── Auto-sync state ─────────────────────────────────────────────────────────
+# ── Sync-session caches ─────────────────────────────────────────────────────
+# The shared sync lock and the last-sync timestamp live in
+# ``hevy2garmin.syncstate``; the auto-sync loop lives in
+# ``hevy2garmin.autosync``. What is left here is the exercise-mapping cache and
+# the per-session failed-upload set, which only this module's routes touch.
 
-_autosync_timer: threading.Timer | None = None
-_autosync_lock = threading.Lock()
-_sync_executing = threading.Lock()  # Prevents concurrent sync execution
-_sync_lock_acquired_at: float = 0  # time.time() when lock was acquired
-_SYNC_LOCK_TIMEOUT = 300  # 5 minutes — force-release if exceeded
-_last_sync_time: datetime | None = None
 _unmapped_cache: list[tuple[str, int]] | None = None
 _unmapped_cache_time: float = 0
 _failed_ids: set[str] = set()  # Workouts that failed upload this session (retried next session)
-
-
-def _acquire_sync_lock() -> bool:
-    """Try to acquire the sync lock. Force-release if held too long (hung sync)."""
-    global _sync_lock_acquired_at
-    if _sync_executing.acquire(blocking=False):
-        _sync_lock_acquired_at = time.time()
-        return True
-    # Check if the lock has been held too long (hung sync)
-    if _sync_lock_acquired_at and (time.time() - _sync_lock_acquired_at) > _SYNC_LOCK_TIMEOUT:
-        logger.warning("Sync lock held for >%ds — force-releasing (likely hung)", _SYNC_LOCK_TIMEOUT)
-        try:
-            _sync_executing.release()
-        except RuntimeError:
-            pass
-        if _sync_executing.acquire(blocking=False):
-            _sync_lock_acquired_at = time.time()
-            return True
-    return False
 
 
 def _get_unmapped_exercises() -> list[tuple[str, int]]:
@@ -174,156 +301,55 @@ def _get_unmapped_exercises() -> list[tuple[str, int]]:
     return _unmapped_cache
 
 
-def _run_autosync() -> None:
-    """Execute a sync and reschedule if still enabled."""
-    global _last_sync_time
-    config = load_config()
-    auto_cfg = config.get("auto_sync", {})
-    if not auto_cfg.get("enabled", False):
-        return
+def client_ip(request: Request) -> str:
+    """Best-effort real client IP.
 
-    if not _acquire_sync_lock():
-        logger.info("Auto-sync: skipped — another sync is running")
-        _schedule_autosync(auto_cfg.get("interval_minutes", 30))
-        return
+    Behind Vercel/Cloudflare the edge populates ``X-Forwarded-For`` and the
+    leftmost entry is the original client (proxies append their hops on the
+    right). Falls back to ``X-Real-IP``, then the socket peer, and finally the
+    literal ``"unknown"`` bucket for header-less clients (so a missing header
+    can't create unbounded rate-limit buckets).
+    """
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    xrip = request.headers.get("x-real-ip")
+    if xrip:
+        return xrip.strip()
+    return request.client.host if request.client else "unknown"
 
-    logger.info("Auto-sync: running scheduled sync")
-    hevy_auth_failed = False
+
+def is_https(request: Request) -> bool:
+    """True when the original request was HTTPS.
+
+    On Vercel, TLS terminates at the edge and the app sees ``http`` plus an
+    ``X-Forwarded-Proto: https`` header, so we check both.
+    """
+    if request.url.scheme == "https":
+        return True
+    return request.headers.get("x-forwarded-proto", "").split(",")[0].strip() == "https"
+
+
+_epoch_cache = 0
+
+
+def _session_epoch() -> int:
+    """Current 'sign out everywhere' epoch from app_config.
+
+    Best-effort: on a DB error, return the last value we successfully read
+    (default 0) so a transient outage never spuriously invalidates sessions.
+    """
+    global _epoch_cache
     try:
-        result = sync(limit=10, dry_run=False, record_log=False, respect_grace=True)
-    except Exception as e:
-        from hevy2garmin.hevy import HevyAuthError
-        if isinstance(e, HevyAuthError):
-            logger.error("Auto-sync: Hevy API key invalid — disabling auto-sync. %s", e)
-            config["auto_sync"]["enabled"] = False
-            save_config(config)
-            # Also persist to DB (Vercel filesystem is read-only)
-            if db.get_database_url():
-                try:
-                    import json as _json
-                    _db = db.get_db()
-                    if hasattr(_db, '_get_conn'):
-                        with _db._get_conn() as conn:
-                            with conn.cursor() as cur:
-                                cur.execute("""
-                                    INSERT INTO platform_credentials (platform, auth_type, credentials, status)
-                                    VALUES ('auto_sync', 'config', %s, 'active')
-                                    ON CONFLICT (platform) DO UPDATE SET credentials = EXCLUDED.credentials
-                                """, (_json.dumps({"enabled": False, "interval_minutes": config.get("auto_sync", {}).get("interval_minutes", 120)}),))
-                            conn.commit()
-                except Exception:
-                    pass
-            hevy_auth_failed = True
-        result = {"synced": 0, "skipped": 0, "failed": 1, "error": str(e)}
-    finally:
-        _sync_executing.release()
-
-    if hevy_auth_failed:
-        return  # Don't reschedule
-
-    _last_sync_time = datetime.now(timezone.utc)
-    _record_sync_log(result, trigger="auto")
-
-    # Reschedule
-    _schedule_autosync(auto_cfg.get("interval_minutes", 30))
-
-
-def _schedule_autosync(interval_minutes: int) -> None:
-    """Schedule the next auto-sync run."""
-    global _autosync_timer
-    with _autosync_lock:
-        if _autosync_timer is not None:
-            _autosync_timer.cancel()
-        _autosync_timer = threading.Timer(interval_minutes * 60, _run_autosync)
-        _autosync_timer.daemon = True
-        _autosync_timer.start()
-
-
-def _stop_autosync() -> None:
-    """Cancel any pending auto-sync timer."""
-    global _autosync_timer
-    with _autosync_lock:
-        if _autosync_timer is not None:
-            _autosync_timer.cancel()
-            _autosync_timer = None
-
-
-def _record_sync_log(result: dict, trigger: str = "manual") -> None:
-    """Record a sync result to SQLite."""
-    db.record_sync_log(
-        synced=result.get("synced", 0),
-        skipped=result.get("skipped", 0),
-        failed=result.get("failed", 0),
-        trigger=trigger,
-    )
-
-
-def _get_autosync_status() -> dict[str, Any]:
-    """Build auto-sync status dict for templates."""
-    config = load_config()
-    auto_cfg = config.get("auto_sync", {})
-    enabled = auto_cfg.get("enabled", False)
-    interval = auto_cfg.get("interval_minutes", 30)
-
-    # On cloud, read persisted state from DB (filesystem config doesn't persist)
-    if db.get_database_url():
-        try:
-            import json as _json
-            _db = db.get_db()
-            if hasattr(_db, '_get_conn'):
-                with _db._get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT credentials FROM platform_credentials WHERE platform = 'auto_sync' LIMIT 1")
-                        row = cur.fetchone()
-                        if row and row.get("credentials"):
-                            creds = row["credentials"] if isinstance(row["credentials"], dict) else _json.loads(row["credentials"])
-                            enabled = creds.get("enabled", False)
-                            interval = creds.get("interval_minutes", 120)
-        except Exception:
-            pass
-
-    status: dict[str, Any] = {
-        "enabled": enabled,
-        "interval_minutes": interval,
-        "last_sync": None,
-        "next_sync": None,
-    }
-
-    if _last_sync_time:
-        elapsed = datetime.now(timezone.utc) - _last_sync_time
-        minutes_ago = int(elapsed.total_seconds() / 60)
-        if minutes_ago < 1:
-            status["last_sync"] = "just now"
-        elif minutes_ago < 60:
-            status["last_sync"] = f"{minutes_ago} min ago"
-        else:
-            hours_ago = minutes_ago // 60
-            status["last_sync"] = f"{hours_ago}h {minutes_ago % 60}m ago"
-
-        if enabled:
-            remaining = interval - minutes_ago
-            if remaining <= 0:
-                status["next_sync"] = "soon"
-            elif remaining < 60:
-                status["next_sync"] = f"in {remaining} min"
-            else:
-                status["next_sync"] = f"in {remaining // 60}h {remaining % 60}m"
-
-    return status
-
-
-@app.on_event("startup")
-async def _startup_autosync() -> None:
-    """Start auto-sync timer on server startup if enabled."""
-    config = load_config()
-    auto_cfg = config.get("auto_sync", {})
-    if auto_cfg.get("enabled", False):
-        interval = auto_cfg.get("interval_minutes", 30)
-        logger.info("Auto-sync enabled on startup: every %d min", interval)
-        _schedule_autosync(interval)
+        v = db.get_db().get_app_config("session_epoch")
+        _epoch_cache = int(v.get("n", 0)) if isinstance(v, dict) else 0
+    except Exception:
+        return _epoch_cache
+    return _epoch_cache
 
 
 _is_configured_cache: bool | None = None
+
 
 @app.middleware("http")
 async def check_setup(request: Request, call_next):
@@ -336,26 +362,34 @@ async def check_setup(request: Request, call_next):
         return await call_next(request)
 
     # ── Dashboard auth gate ──────────────────────────────────────────────
-    # When H2G_PASSWORD is set, all routes except /login and /api/cron/*
+    # When a password is set, all routes except /login and /api/cron/*
     # require a valid session cookie. Without it, redirect to /login.
     if auth_enabled() and path not in ("/login",) and not path.startswith("/api/cron/"):
         session_cookie = request.cookies.get(SESSION_COOKIE)
-        if not verify_session(session_cookie):
+        if not verify_session(session_cookie, _session_epoch()):
             if path.startswith("/api/"):
                 from starlette.responses import Response
                 return Response("Unauthorized", status_code=401)
             return RedirectResponse(f"/login?next={path}")
 
     # Auth check for POST /api/* endpoints (CSRF protection).
-    # Cron has its own Bearer token check. All others require the cookie or X-Api-Key.
-    if secret and request.method == "POST" and path.startswith("/api/") and path != "/api/cron/sync":
+    # Cron and the Hevy webhook have their own Bearer token check. All others
+    # require the cookie or X-Api-Key.
+    if (
+        secret
+        and request.method == "POST"
+        and path.startswith("/api/")
+        and path not in ("/api/cron/sync", "/api/cron/webhook")
+    ):
         token = request.cookies.get("h2g_auth") or request.headers.get("x-api-key")
         if token != secret:
             from starlette.responses import Response
             return Response("Unauthorized", status_code=401)
 
     # Setup page and sync endpoints: skip the "is configured?" redirect
-    if path in ("/login", "/setup", "/api/sync-one", "/api/cron/sync", "/api/setup-actions", "/api/garmin-ticket"):
+    if path in ("/login", "/setup", "/api/sync-one", "/api/cron/sync", "/api/cron/webhook",
+                "/api/setup-actions", "/api/garmin-ticket", "/api/garmin-login",
+                "/api/garmin-login-mfa"):
         response = await call_next(request)
     else:
         # Redirect to setup if not configured
@@ -370,38 +404,125 @@ async def check_setup(request: Request, call_next):
     # Auto-set auth cookie on every GET so it survives cookie clears and new devices.
     # SameSite=strict prevents cross-origin POSTs from using it (CSRF protection).
     if secret and request.method == "GET" and not request.cookies.get("h2g_auth"):
-        response.set_cookie("h2g_auth", secret, httponly=True, samesite="strict", max_age=365 * 86400)
+        response.set_cookie("h2g_auth", secret, httponly=True, samesite="strict",
+                            secure=is_https(request), max_age=365 * 86400)
 
+    return response
+
+
+# Registered after check_setup so it wraps it, which is what lets it fix the
+# Location of the redirects check_setup issues itself (the /login and /setup
+# gates) — those never reach a route handler.
+@app.middleware("http")
+async def reverse_proxy_prefix(request: Request, call_next):
+    """Serve correctly when a proxy mounts this app below the origin root.
+
+    Reads X-Forwarded-Prefix (e.g. "/apps/hevy2garmin") once per request and
+    publishes it for the rest of the request; the trailing slash is trimmed so
+    callers concatenate a leading-slash path. Redirect targets are moved onto
+    the prefix here, because a proxy sees only a root-relative Location it has
+    no way to attribute. Empty header = empty prefix = unchanged behaviour.
+
+    The header is only read when H2G_TRUST_FORWARDED_PREFIX is set, and then only
+    if it is a plain absolute path — see trust_forwarded_prefix and
+    _validated_prefix. Anything else is treated as no prefix at all.
+    """
+    prefix = (
+        _validated_prefix(request.headers.get("x-forwarded-prefix", ""))
+        if trust_forwarded_prefix()
+        else ""
+    )
+    token = _url_prefix.set(prefix)
+    try:
+        response = await call_next(request)
+    finally:
+        _url_prefix.reset(token)
+    if prefix:
+        location = response.headers.get("location")
+        if location:
+            response.headers["location"] = _prefix_location(location, prefix)
+    return response
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Defense-in-depth response headers. Registered after check_setup so it is
+    the outermost middleware and stamps every response — including redirects and
+    the lock/DB pages."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    # Pragmatic CSP: only the high-value, no-cost directives. A strict
+    # script/style policy is deferred because the templates use inline JS and
+    # load scripts from CDNs (would need 'unsafe-inline').
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "frame-ancestors 'none'; form-action 'self'; base-uri 'self'",
+    )
+    if is_https(request):
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
     return response
 
 
 # ── Auth pages ───────────────────────────────────────────────────────────────
 
+def _render_login(*, error: str | None, status_code: int = 200) -> HTMLResponse:
+    """Render login.html. Not routed through _render: it has no shared context."""
+    prefix = _url_prefix.get()
+    html = _jinja_env.get_template("login.html").render(error=error, url_prefix=prefix)
+    return HTMLResponse(_apply_prefix(html, prefix), status_code=status_code)
+
+
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
     """Show login form. Redirects to dashboard if already authenticated or auth disabled."""
-    if not auth_enabled() or verify_session(request.cookies.get(SESSION_COOKIE)):
+    if not auth_enabled() or verify_session(request.cookies.get(SESSION_COOKIE), _session_epoch()):
         return RedirectResponse("/")
     error = request.query_params.get("error")
-    return HTMLResponse(_jinja_env.get_template("login.html").render(error=error))
+    return _render_login(error=error)
 
 
 @app.post("/login")
 async def login_submit(request: Request, password: str = Form(...)):
-    """Verify password, set session cookie, redirect to dashboard."""
+    """Verify password (rate-limited), set session cookie, redirect to dashboard."""
     next_url = request.query_params.get("next", "/")
     # Prevent open redirect: only allow relative paths
     if not next_url.startswith("/") or next_url.startswith("//"):
         next_url = "/"
+
+    key = client_ip(request)
+    try:
+        store = db.get_db()
+    except Exception:
+        store = None  # DB unavailable → skip the limiter (never lock the admin out on an outage)
+
+    def _error(msg: str, status: int) -> HTMLResponse:
+        return _render_login(error=msg, status_code=status)
+
+    # Rate limit: check the lockout BEFORE comparing credentials.
+    remaining = login_ratelimit.lockout_remaining(store, key) if store else 0
+    if remaining > 0:
+        return _error(f"Too many attempts. Try again in {format_cooldown(remaining)}.", 429)
+
     if not check_password(password):
-        return HTMLResponse(
-            _jinja_env.get_template("login.html").render(error="Wrong password."),
-            status_code=401,
-        )
+        remaining = 0
+        if store:
+            login_ratelimit.record_failure(store, key)
+            remaining = login_ratelimit.lockout_remaining(store, key)
+        if remaining > 0:
+            return _error(f"Too many attempts. Try again in {format_cooldown(remaining)}.", 429)
+        return _error("Wrong password.", 401)
+
+    if store:
+        login_ratelimit.clear_failures(store, key)
     response = RedirectResponse(next_url, status_code=303)
     response.set_cookie(
-        SESSION_COOKIE, sign_session(),
-        httponly=True, samesite="strict", max_age=30 * 24 * 3600,
+        SESSION_COOKIE, sign_session(_session_epoch()),
+        httponly=True, samesite="strict", secure=is_https(request), max_age=session_ttl(),
     )
     return response
 
@@ -409,6 +530,28 @@ async def login_submit(request: Request, password: str = Form(...)):
 @app.post("/logout")
 async def logout():
     """Clear session cookie and redirect to login."""
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(SESSION_COOKIE)
+    return response
+
+
+@app.post("/logout-all")
+async def logout_all():
+    """Sign out everywhere: bump the server-side epoch so every outstanding
+    session cookie (on all devices) stops validating."""
+    global _epoch_cache
+    try:
+        store = db.get_db()
+        cur = store.get_app_config("session_epoch")
+        n = int(cur.get("n", 0)) if isinstance(cur, dict) else 0
+        store.set_app_config("session_epoch", {"n": n + 1})
+        _epoch_cache = n + 1
+    except Exception:
+        # Don't pretend success: the epoch never advanced, so other devices are
+        # still signed in. Keep this session and surface the error so the admin
+        # can retry, instead of redirecting to /login as if it worked.
+        logger.warning("could not bump session epoch for /logout-all", exc_info=True)
+        return RedirectResponse("/settings?err=logout_all", status_code=303)
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(SESSION_COOKIE)
     return response
@@ -499,7 +642,7 @@ async def dashboard(request: Request):
         skipped_count=terminal_counts["skipped"],
         hevy_total=hevy_total,
         recent=recent,
-        auto_sync=_get_autosync_status(),
+        auto_sync=autosync.status(),
         sync_log=db.get_sync_log(10),
         mapping_count=mapping_count,
         garmin_connected=garmin_connected,
@@ -508,6 +651,16 @@ async def dashboard(request: Request):
         garmin_cooldown_str=garmin_cooldown_str,
     )
 
+
+
+def _direct_garmin_login() -> bool:
+    """Whether the dashboard collects Garmin credentials itself.
+
+    Off by default: the hosted deployment hands the login to the exchange
+    worker so the app never sees a Garmin password. Self-hosted installs can
+    opt in, keeping the credentials on their own machine.
+    """
+    return os.environ.get("H2G_DIRECT_GARMIN_LOGIN", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 @app.get("/setup", response_class=HTMLResponse)
@@ -521,11 +674,13 @@ async def setup_page(request: Request):
     except Exception:
         pass
     return _render("setup.html", config=load_config(), is_cloud=bool(db.get_database_url()),
-                   garmin_cooldown=garmin_cooldown, garmin_cooldown_str=garmin_cooldown_str)
+                   garmin_cooldown=garmin_cooldown, garmin_cooldown_str=garmin_cooldown_str,
+                   direct_garmin_login=_direct_garmin_login())
 
 
 @app.post("/setup")
 async def setup_save(
+    request: Request,
     hevy_api_key: str = Form(""),
     garmin_email: str = Form(""),
     garmin_password: str = Form(""),
@@ -661,7 +816,8 @@ async def setup_save(
     # Set auth cookie if HEVY2GARMIN_SECRET is configured (cloud deployments)
     secret = os.environ.get("HEVY2GARMIN_SECRET")
     if secret:
-        response.set_cookie("h2g_auth", secret, httponly=True, samesite="strict", max_age=365 * 86400)
+        response.set_cookie("h2g_auth", secret, httponly=True, samesite="strict",
+                            secure=is_https(request), max_age=365 * 86400)
     return response
 
 
@@ -728,6 +884,55 @@ async def api_garmin_rate_limited(request: Request):
     except Exception as e:
         logger.warning("Could not record rate-limit: %s", e)
         return HTMLResponse(_json.dumps({"cooldown_seconds": 0}))
+
+
+@app.post("/api/garmin-login")
+async def garmin_login_begin(request: Request):
+    """Direct (self-hosted) Garmin login, step 1. The password never leaves the host."""
+    from fastapi.responses import JSONResponse
+
+    body = await request.json()
+    email = (body.get("email") or "").strip()
+    password = body.get("password") or ""
+    if not email or not password:
+        return JSONResponse({"status": "error", "message": "Email and password required"}, status_code=400)
+
+    # Same limiter the dashboard login uses. Garmin rate-limits the account
+    # itself, so hammering this endpoint locks the user out upstream — worth
+    # throttling locally first, especially on an open self-host.
+    key = f"garmin-login:{client_ip(request)}"
+    try:
+        store = db.get_db()
+    except Exception:
+        store = None  # DB unavailable → skip the limiter, never block setup on an outage
+    remaining = login_ratelimit.lockout_remaining(store, key) if store else 0
+    if remaining > 0:
+        return JSONResponse(
+            {"status": "error", "message": f"Too many attempts. Try again in {format_cooldown(remaining)}."},
+            status_code=429,
+        )
+
+    result = await run_in_threadpool(garmin_login.begin, email, password)
+    if store:
+        if result.get("status") in ("success", "needs_mfa"):
+            login_ratelimit.clear_failures(store, key)
+        else:
+            login_ratelimit.record_failure(store, key)
+    return JSONResponse(result)
+
+
+@app.post("/api/garmin-login-mfa")
+async def garmin_login_mfa(request: Request):
+    """Direct (self-hosted) Garmin login, step 2 — submit the MFA code."""
+    from fastapi.responses import JSONResponse
+
+    body = await request.json()
+    session_id = (body.get("session_id") or "").strip()
+    code = (body.get("code") or "").strip()
+    if not session_id or not code:
+        return JSONResponse({"status": "error", "message": "session_id and code required"}, status_code=400)
+    result = await run_in_threadpool(garmin_login.complete, session_id, code)
+    return JSONResponse(result)
 
 
 @app.get("/workouts", response_class=HTMLResponse)
@@ -830,6 +1035,27 @@ async def workouts_page(request: Request):
     return _render("workouts.html", workouts=workouts, hr_fusion_enabled=hr_fusion, page=page, page_count=page_count, fetch_error=fetch_error)
 
 
+def _daily_hr_to_samples(daily_hr: object, start_ms: int, end_ms: int) -> list[dict]:
+    """Slice Garmin daily HR (``heartRateValues``) to a workout window.
+
+    Garmin returns ``{"heartRateValues": null}`` for a day with no wellness HR yet
+    (common for the current day, before all-day HR is populated), so the key is
+    present with value ``None`` and ``.get(..., [])`` does NOT fall back. Guard the
+    ``None`` before iterating so the endpoint returns an empty series instead of
+    crashing with "'NoneType' object is not iterable" (#326).
+    """
+    hr_values = daily_hr.get("heartRateValues") if isinstance(daily_hr, dict) else None
+    samples: list[dict] = []
+    for entry in hr_values or []:
+        if isinstance(entry, list) and len(entry) >= 2 and entry[1] is not None:
+            ts, bpm = entry[0], entry[1]
+            if start_ms - 60000 <= ts <= end_ms + 60000:  # ±1 min buffer
+                secs_from_start = (ts - start_ms) / 1000
+                samples.append({"time": max(0, secs_from_start), "hr": bpm})
+    samples.sort(key=lambda x: x["time"])
+    return samples
+
+
 @app.get("/api/workout/{hevy_id}/hr", response_class=HTMLResponse)
 async def api_workout_hr(request: Request, hevy_id: str):
     """Fetch HR data for a workout's matched Garmin activity. Returns JSON for Chart.js.
@@ -889,17 +1115,7 @@ async def api_workout_hr(request: Request, hevy_id: str):
         # Fetch daily HR data and slice to workout window
         date_str = w_start[:10]
         daily_hr = limiter.call(garmin_client.get_heart_rates, date_str)
-        hr_values = daily_hr.get("heartRateValues", []) if isinstance(daily_hr, dict) else []
-
-        hr_samples = []
-        for entry in hr_values:
-            if isinstance(entry, list) and len(entry) >= 2 and entry[1] is not None:
-                ts, bpm = entry[0], entry[1]
-                if start_ms - 60000 <= ts <= end_ms + 60000:  # ±1 min buffer
-                    secs_from_start = (ts - start_ms) / 1000
-                    hr_samples.append({"time": max(0, secs_from_start), "hr": bpm})
-
-        hr_samples.sort(key=lambda x: x["time"])
+        hr_samples = _daily_hr_to_samples(daily_hr, start_ms, end_ms)
 
         # Build exercise segments — proportional to actual workout duration
         exercises = workout.get("exercises", [])
@@ -996,13 +1212,14 @@ async def settings_page(request: Request):
     merge_extra_types = ", ".join(
         t for t in config.get("merge_activity_types", ["strength_training"]) if t != "strength_training"
     )
-    return _render("settings.html", config=config, unmapped=sorted(unmapped.items(), key=lambda x: -x[1]), merge_extra_types=merge_extra_types)
+    return _render("settings.html", config=config, unmapped=sorted(unmapped.items(), key=lambda x: -x[1]), merge_extra_types=merge_extra_types, err=request.query_params.get("err"))
 
 
 @app.post("/settings")
 async def settings_save(
     hevy_api_key: str = Form(""), garmin_email: str = Form(""), garmin_password: str = Form(""),
     weight_kg: float = Form(80.0), birth_year: int = Form(1990), sex: str = Form("male"), vo2max: float = Form(45.0),
+    timezone: str = Form(""),
     working_set_seconds: int = Form(40), warmup_set_seconds: int = Form(25),
     rest_between_sets_seconds: int = Form(75), rest_between_exercises_seconds: int = Form(120),
     hr_fusion_enabled: str = Form("off"),
@@ -1011,7 +1228,7 @@ async def settings_save(
     merge_overlap_pct: int = Form(70),
     merge_max_drift_min: int = Form(20),
     merge_extra_types: str = Form(""),
-    merge_watch_strategy: str = Form("replace"),
+    merge_watch_strategy: str = Form("merge"),
 ):
     if is_demo_mode():
         return HTMLResponse('<div class="toast toast-error">Settings are read-only in demo mode</div>')
@@ -1023,7 +1240,10 @@ async def settings_save(
         config["garmin_email"] = garmin_email
     if garmin_password:
         config["garmin_password"] = garmin_password
-    config["user_profile"].update(weight_kg=weight_kg, birth_year=birth_year, sex=sex, vo2max=vo2max)
+    config["user_profile"].update(
+        weight_kg=weight_kg, birth_year=birth_year, sex=sex, vo2max=vo2max,
+        timezone=timezone.strip(),
+    )
     config["timing"].update(
         working_set_seconds=working_set_seconds, warmup_set_seconds=warmup_set_seconds,
         rest_between_sets_seconds=rest_between_sets_seconds,
@@ -1042,7 +1262,7 @@ async def settings_save(
     config["merge_activity_types"] = ["strength_training"] + [
         t for t in dict.fromkeys(extra_types) if t != "strength_training"
     ]
-    config["merge_watch_strategy"] = merge_watch_strategy if merge_watch_strategy in ("replace", "merge", "describe") else "replace"
+    config["merge_watch_strategy"] = merge_watch_strategy if merge_watch_strategy in ("replace", "merge", "describe") else "merge"
     save_config(config)
 
     # Persist settings to DB on cloud (filesystem is read-only on Vercel)
@@ -1241,8 +1461,6 @@ async def api_pull_garmin_profile(request: Request):
 
 @app.post("/api/sync", response_class=HTMLResponse)
 async def api_sync(request: Request):
-    global _last_sync_time
-
     if is_demo_mode():
         from fastapi.responses import JSONResponse
         return JSONResponse({"status": "demo", "message": "Sync disabled in demo mode"})
@@ -1296,7 +1514,7 @@ async def api_sync(request: Request):
         sync_kwargs["since"] = since_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
         sync_kwargs["fetch_all"] = True  # paginate until we hit the date
 
-    if not _acquire_sync_lock():
+    if not syncstate.acquire_sync_lock():
         return HTMLResponse('<div class="toast toast-error">Another sync is already running. Please wait.</div>')
 
     try:
@@ -1304,10 +1522,90 @@ async def api_sync(request: Request):
     except Exception as e:
         result = {"synced": 0, "skipped": 0, "failed": 1, "unmapped": [], "error": str(e)}
     finally:
-        _sync_executing.release()
-    _last_sync_time = datetime.now(timezone.utc)
-    _record_sync_log(result, trigger=f"manual ({scope})")
+        syncstate.release_sync_lock()
+    syncstate.mark_synced()
+    syncstate.record_sync_log(result, trigger=f"manual ({scope})")
     return _render("partials/sync_result.html", result=result)
+
+
+_SCHEDULES_PAGE_SIZES = (10, 25, 100)
+_SCHEDULES_PAGE_SIZE = _SCHEDULES_PAGE_SIZES[0]
+
+
+def _schedules_context(
+    page: int, start_date: str | None = None, title: str | None = None, page_size: int | None = None
+) -> dict:
+    """Build the paginated 'scheduled workouts' context (local DB only).
+
+    ``start_date`` (default today) filters to entries on/after that date; ``title``
+    filters by routine name (case-insensitive substring); ``page_size`` (one of
+    ``_SCHEDULES_PAGE_SIZES``, default 10) sets rows per page. All are echoed back so
+    the filter form, selector and the pagination/refresh URLs keep the current state.
+    """
+    _db = db.get_db()
+    start = start_date or date.today().isoformat()
+    try:
+        date.fromisoformat(start)  # guard the query and the value echoed into the form
+    except (ValueError, TypeError):
+        start = date.today().isoformat()
+    title = (title or "").strip()
+    size = page_size if page_size in _SCHEDULES_PAGE_SIZES else _SCHEDULES_PAGE_SIZE
+    total = _db.count_upcoming_routine_schedules(start, title or None)
+    total_pages = max(1, ceil(total / size))
+    page = max(1, min(page, total_pages))
+    rows = _db.get_upcoming_routine_schedules(
+        start, size, (page - 1) * size, title or None
+    )
+    return {
+        "scheduled_workouts": rows,
+        "page": page,
+        "total_pages": total_pages,
+        "sched_total": total,
+        "start_date": start,
+        "title_query": title,
+        "page_size": size,
+        "page_sizes": _SCHEDULES_PAGE_SIZES,
+    }
+
+
+# Timestamp cache for the page-load routine reconciliation, kept in the app_config KV
+# store (like ratelimit's cooldown) so it survives serverless restarts. The reconcile
+# *result* is the synced_routines.status column itself — this only throttles the check.
+_ROUTINE_RECONCILE_KEY = "routine_reconcile"
+_ROUTINE_RECONCILE_TTL = 300  # seconds
+
+
+def _reconcile_routines_best_effort(store, config: dict) -> None:
+    """Refresh "does the Garmin workout still exist" state, at most every TTL.
+
+    Best-effort by design: any failure (no Garmin auth, rate-limit cooldown, network)
+    leaves the DB state untouched and the page renders from it.
+    """
+    try:
+        from hevy2garmin._isotime import parse_iso
+        from hevy2garmin.garmin import get_client, list_workouts
+        from hevy2garmin.reconcile import reconcile_missing_routine_workouts
+
+        state = store.get_app_config(_ROUTINE_RECONCILE_KEY) or {}
+        if state.get("checked_at"):
+            age = (datetime.now(timezone.utc) - parse_iso(state["checked_at"])).total_seconds()
+            if age < _ROUTINE_RECONCILE_TTL:
+                return
+        if cooldown_remaining(store) > 0:
+            return
+        if not any(r.get("garmin_workout_id") for r in store.list_synced_routines()):
+            return  # nothing to check — don't even authenticate
+        client = get_client(
+            config.get("garmin_email"), config.get("garmin_password", ""),
+            config.get("garmin_token_dir", "~/.garminconnect"),
+        )
+        reconcile_missing_routine_workouts(store, list_workouts(client, limit=999))
+        store.set_app_config(
+            _ROUTINE_RECONCILE_KEY,
+            {"checked_at": datetime.now(timezone.utc).isoformat()},
+        )
+    except Exception:
+        logger.debug("routine reconcile on page load skipped", exc_info=True)
 
 
 @app.get("/routines", response_class=HTMLResponse)
@@ -1316,27 +1614,82 @@ async def routines_page(request: Request):
     config = load_config()
     routines: list[dict] = []
     fetch_error = None
+    # Local-DB data — load it outside the Hevy fetch so the schedules table still
+    # renders even when Hevy is unreachable.
+    try:
+        schedules = _schedules_context(1)
+    except Exception:
+        logger.exception("Failed to load scheduled workouts")
+        schedules = {"scheduled_workouts": [], "page": 1, "total_pages": 1, "sched_total": 0}
     try:
         from hevy2garmin.hevy import HevyClient
-        from hevy2garmin.sync import fetch_all_routines, _cache_routines_total
+        from hevy2garmin.sync import fetch_all_routines, _cache_routines_total, routine_payload_hash
 
         _db = db.get_db()
+        _reconcile_routines_best_effort(_db, config)
         hevy = HevyClient(api_key=config.get("hevy_api_key"))
         all_routines = fetch_all_routines(hevy)
         _cache_routines_total(_db, len(all_routines))
         for r in all_routines:
             record = _db.get_synced_routine(r.get("id", ""))
+            exercises = [
+                {
+                    "name": ex.get("title") or ex.get("name") or "Exercise",
+                    "sets": len(ex.get("sets") or []),
+                }
+                for ex in (r.get("exercises") or [])
+            ]
+            # The routine drifted on Hevy since the last sync when the payload it
+            # would produce now no longer hashes to what we synced. Legacy rows with
+            # no stored hash count as drifted — a sync would recreate them too.
+            needs_update = False
+            if record is not None:
+                try:
+                    needs_update = record.get("content_hash") != routine_payload_hash(r, config)
+                except Exception:
+                    logger.debug("Could not hash routine %s", r.get("id"), exc_info=True)
             routines.append({
                 "id": r.get("id", ""),
                 "title": r.get("title") or r.get("name") or "Routine",
-                "exercise_count": len(r.get("exercises", [])),
+                "exercises": exercises,
+                "exercise_count": len(exercises),
                 "synced": record is not None,
+                "needs_update": needs_update,
+                "missing": (record or {}).get("status") == "missing_on_garmin",
                 "scheduled_date": (record or {}).get("scheduled_date"),
             })
     except Exception:
         logger.exception("Failed to load Hevy routines")
         fetch_error = "Could not load routines from Hevy. Check your API key and try again."
-    return _render("routines.html", request=request, routines=routines, fetch_error=fetch_error)
+
+    total = len(routines)
+    synced = sum(1 for r in routines if r["synced"])
+    stats = {
+        "total": total,
+        "synced": synced,
+        "pending": max(0, total - synced),
+        "needs_update": sum(1 for r in routines if r["needs_update"]),
+        "scheduled": sum(1 for r in routines if r["scheduled_date"]),
+        "pct": round(synced / total * 100) if total else 0,
+    }
+    return _render(
+        "routines.html", request=request, routines=routines, stats=stats,
+        fetch_error=fetch_error, **schedules
+    )
+
+
+@app.get("/api/routines/schedules", response_class=HTMLResponse)
+async def api_routines_schedules(
+    request: Request, page: int = 1, start: str | None = None, q: str | None = None,
+    size: int = _SCHEDULES_PAGE_SIZE,
+):
+    """Return the paginated 'scheduled workouts' table fragment (HTMX navigation/filter)."""
+    try:
+        ctx = _schedules_context(page, start, q, size)
+    except Exception:
+        logger.exception("Failed to load scheduled workouts")
+        return HTMLResponse('<div class="toast toast-error">Could not load scheduled workouts.</div>')
+    return _render("routine_schedules.html", **ctx)
 
 
 @app.post("/api/routines/sync", response_class=HTMLResponse)
@@ -1348,7 +1701,7 @@ async def api_routines_sync(request: Request):
     form = await request.form()
     force = form.get("force") in ("1", "true", "on")
 
-    if not _acquire_sync_lock():
+    if not syncstate.acquire_sync_lock():
         return HTMLResponse('<div class="toast toast-error">Another sync is already running. Please wait.</div>')
 
     try:
@@ -1357,7 +1710,7 @@ async def api_routines_sync(request: Request):
         logger.exception("Routine sync failed")
         return HTMLResponse('<div class="toast toast-error">Routine sync failed. Check the logs for details.</div>')
     finally:
-        _sync_executing.release()
+        syncstate.release_sync_lock()
 
     msg = (
         f"{result['created']} created, {result['updated']} updated, "
@@ -1365,7 +1718,45 @@ async def api_routines_sync(request: Request):
         + (f", {result['scheduled']} scheduled" if result.get("scheduled") else "")
     )
     cls = "toast-error" if result["failed"] else "toast-success"
-    return HTMLResponse(f'<div class="toast {cls}">Routine sync complete: {msg}</div>')
+    # Sync's restore path can (re)schedule routines, so refresh the schedules table too.
+    return HTMLResponse(
+        f'<div class="toast {cls}">Routine sync complete: {msg}</div>',
+        headers={"HX-Trigger": "refreshSchedules"},
+    )
+
+
+@app.post("/api/routines/{hevy_routine_id}/sync", response_class=HTMLResponse)
+async def api_routine_sync_one(request: Request, hevy_routine_id: str):
+    """Sync a single Hevy routine and swap its table row in place."""
+    if is_demo_mode():
+        return HTMLResponse('<div class="toast toast-success">Sync disabled in demo mode.</div>')
+
+    form = await request.form()
+    force = form.get("force") in ("1", "true", "on")
+
+    if not syncstate.acquire_sync_lock():
+        return HTMLResponse('<div class="toast toast-error">Another sync is already running. Please wait.</div>')
+
+    try:
+        result = sync_routine(hevy_routine_id, force=force)
+    except Exception:
+        logger.exception("Routine %s sync failed", hevy_routine_id)
+        return HTMLResponse('<div class="toast toast-error">Routine sync failed. Check the logs for details.</div>')
+    finally:
+        syncstate.release_sync_lock()
+
+    outcome = result["outcome"]
+    # The routine title is user-controlled (Hevy account data), so escape it before
+    # interpolating into the toast HTML — these f-strings bypass Jinja's autoescape.
+    title = escape(result["row"]["title"])
+    if outcome == "failed":
+        return HTMLResponse(f'<div class="toast toast-error">Could not sync "{title}". Check the logs.</div>')
+    # Toast into #routines-result plus an out-of-band swap of the updated row, so it flips
+    # to "synced" (and gains the Schedule form) without a full page reload. HX-Trigger
+    # refreshes the schedules table since the restore path may have re-booked dates.
+    row_html = _render("routine_row.html", r=result["row"], oob=True).body.decode()
+    toast = f'<div class="toast toast-success">Synced "{title}" ({outcome}).</div>'
+    return HTMLResponse(toast + row_html, headers={"HX-Trigger": "refreshSchedules"})
 
 
 @app.post("/api/routines/{hevy_routine_id}/schedule", response_class=HTMLResponse)
@@ -1387,7 +1778,7 @@ async def api_routine_schedule(request: Request, hevy_routine_id: str):
     except (ValueError, TypeError) as e:
         return HTMLResponse(f'<div class="toast toast-error">Invalid schedule: {e}</div>')
 
-    if not _acquire_sync_lock():
+    if not syncstate.acquire_sync_lock():
         return HTMLResponse('<div class="toast toast-error">Another sync is already running. Please wait.</div>')
 
     try:
@@ -1398,13 +1789,39 @@ async def api_routine_schedule(request: Request, hevy_routine_id: str):
         logger.exception("Scheduling routine %s failed", hevy_routine_id)
         return HTMLResponse('<div class="toast toast-error">Scheduling failed. Check the logs for details.</div>')
     finally:
-        _sync_executing.release()
+        syncstate.release_sync_lock()
 
     n = result["scheduled"]
     span = f" ({result['dates'][0]} → {result['dates'][-1]})" if n > 1 else f" on {result['dates'][0]}"
+    # HX-Trigger fires a client event so the "Scheduled workouts" table refreshes itself.
     return HTMLResponse(
-        f'<div class="toast toast-success">Scheduled {n} session(s){span}.</div>'
+        f'<div class="toast toast-success">Scheduled {n} session(s){span}.</div>',
+        headers={"HX-Trigger": "refreshSchedules"},
     )
+
+
+@app.post("/api/routines/{hevy_routine_id}/schedule/{schedule_id}/unschedule", response_class=HTMLResponse)
+async def api_routine_unschedule(
+    request: Request, hevy_routine_id: str, schedule_id: str,
+    page: int = 1, start: str | None = None, q: str | None = None,
+    size: int = _SCHEDULES_PAGE_SIZE,
+):
+    """Remove one scheduled calendar entry, then re-render the schedules table."""
+    if is_demo_mode():
+        return HTMLResponse('<div class="toast toast-success">Unscheduling disabled in demo mode.</div>')
+
+    if not syncstate.acquire_sync_lock():
+        return HTMLResponse('<div class="toast toast-error">Another sync is already running. Please wait.</div>')
+
+    try:
+        unschedule_routine_entry(hevy_routine_id, schedule_id)
+    except Exception:
+        logger.exception("Unscheduling routine %s entry %s failed", hevy_routine_id, schedule_id)
+        return HTMLResponse('<div class="toast toast-error">Could not remove the scheduled workout. Check the logs.</div>')
+    finally:
+        syncstate.release_sync_lock()
+
+    return _render("routine_schedules.html", **_schedules_context(page, start, q, size))
 
 
 @app.post("/api/sync/{workout_id}", response_class=HTMLResponse)
@@ -1427,7 +1844,7 @@ async def api_sync_single(request: Request, workout_id: str):
 
         garmin_client = get_client(config.get("garmin_email"))
         # Manual single-workout upload from the workouts page — bypass grace.
-        sync_one_workout(
+        one = sync_one_workout(
             workout,
             cfg=config,
             garmin_client=garmin_client,
@@ -1435,10 +1852,16 @@ async def api_sync_single(request: Request, workout_id: str):
             respect_grace=False,
             database=db.get_db(),
         )
+        syncstate.record_sync_log(
+            {"synced": 1 if one.status == "synced" else 0,
+             "failed": 1 if one.status == "failed" else 0},
+            trigger="manual (single)",
+        )
 
         start = (workout.get("start_time") or "")[:16]
         return HTMLResponse(f'<tr><td><span class="badge badge-success">✓ Synced</span></td><td>{start}</td><td><strong>{workout["title"]}</strong></td><td>{len(workout.get("exercises", []))}</td><td></td></tr>')
     except Exception as e:
+        syncstate.record_sync_log({"failed": 1}, trigger="manual (single)")
         return HTMLResponse(f'<td colspan="5" style="color: var(--pico-del-color);">Failed: {e}</td>')
 
 
@@ -1668,10 +2091,10 @@ async def api_toggle_autosync(request: Request):
             else:
                 logger.warning("Failed to set up GitHub Actions: %s", msg)
         else:
-            _schedule_autosync(interval)
+            autosync.schedule(interval)
         logger.info("Auto-sync enabled: every %d min", interval)
     else:
-        _stop_autosync()
+        autosync.stop()
         # On Vercel: delete the sync workflow to stop the cron
         if os.environ.get("VERCEL") and os.environ.get("GITHUB_PAT"):
             try:
@@ -1690,7 +2113,7 @@ async def api_toggle_autosync(request: Request):
                 logger.warning("Failed to delete sync workflow: %s", e)
         logger.info("Auto-sync disabled")
 
-    auto_sync = _get_autosync_status()
+    auto_sync = autosync.status()
     return _render("partials/autosync_status.html", auto_sync=auto_sync)
 
 
@@ -1892,21 +2315,59 @@ async def api_setup_actions(request: Request):
 
 
 @app.post("/api/sync-one")
-async def api_sync_one(request: Request):
+async def api_sync_one(request: Request, merge_only: bool = Query(False)):
     """Sync exactly 1 unsynced workout. Returns JSON with status."""
+    # Manual Sync Now — bypass grace so the user gets an immediate upload.
+    return await _sync_one_recorded(
+        respect_grace=False, merge_only=merge_only, trigger="manual (one)"
+    )
+
+
+async def _sync_one_recorded(
+    *,
+    respect_grace: bool = False,
+    merge_only: bool = False,
+    trigger: str = "manual (one)",
+):
+    """Take the sync lock, sync one workout, and record it in the sync log.
+
+    Shared by every single-workout trigger so each one shows up on /history.
+    Dashboard and cron syncs previously left no trace, which made "what ran
+    this sync?" unanswerable when diagnosing a sync that stopped happening.
+    """
+    import json as _json
+
     from fastapi.responses import JSONResponse
 
     if is_demo_mode():
         return JSONResponse({"status": "demo", "message": "Sync disabled in demo mode"})
 
-    if not _acquire_sync_lock():
+    if not syncstate.acquire_sync_lock():
         return JSONResponse({"error": "Sync already running", "busy": True})
 
     try:
-        # Manual Sync Now — bypass grace so the user gets an immediate upload.
-        return await _do_sync_one(request, respect_grace=False)
+        resp = await _do_sync_one(respect_grace=respect_grace, merge_only=merge_only)
+    except Exception:
+        # Record before re-raising, so a crash mid-sync is not the one failure
+        # mode that leaves /history looking healthy. The per-row and auto paths
+        # both record on exception; this makes cron and Sync Now agree.
+        syncstate.record_sync_log({"failed": 1}, trigger=trigger)
+        raise
     finally:
-        _sync_executing.release()
+        syncstate.release_sync_lock()
+
+    try:
+        data = _json.loads(bytes(resp.body))
+        # `failed` is what _do_sync_one reports for a non-synced outcome
+        # ({"synced": 0, one.status: 1}); without it a rejected upload lands as
+        # 0 synced / 0 failed, indistinguishable from "nothing to sync" — the
+        # exact ambiguity this is meant to remove. error/skipped_error are the
+        # hard-stop shapes. needs_review/processing stay 0/0: still in flight.
+        failed = 1 if (data.get("error") or data.get("skipped_error") or data.get("failed")) else 0
+        syncstate.record_sync_log({"synced": data.get("synced", 0), "failed": failed}, trigger=trigger)
+    except Exception:
+        logger.debug("sync_log record failed", exc_info=True)
+    return resp
 
 
 def _scan_for_unsynced(hevy, is_synced, total_count, failed_ids, on_page=None):
@@ -1946,8 +2407,8 @@ def _scan_for_unsynced(hevy, is_synced, total_count, failed_ids, on_page=None):
     return unsynced, unmapped
 
 
-async def _do_sync_one(request: Request, *, respect_grace: bool = False):
-    """Inner sync logic, called with _sync_executing lock held.
+async def _do_sync_one(*, respect_grace: bool = False, merge_only: bool = False):
+    """Inner sync logic, called with the shared sync lock held.
 
     ``respect_grace`` is True for Vercel cron (wait for watch data) and False
     for manual Sync Now.
@@ -2037,6 +2498,7 @@ async def _do_sync_one(request: Request, *, respect_grace: bool = False):
                 cfg=config,
                 garmin_client=garmin_client,
                 respect_grace=False,  # already checked above
+                merge_only=merge_only,
                 database=db.get_db(),
             )
 
@@ -2091,33 +2553,179 @@ async def _do_sync_one(request: Request, *, respect_grace: bool = False):
             return JSONResponse({"synced": 0, "skipped_error": True, "title": unsynced["title"], "remaining": max(0, remaining), "done": remaining <= 0})
 
 
+def _bearer_ok(request: Request, secret: str) -> bool:
+    """Constant-time check of `Authorization: Bearer <secret>`.
+
+    compare_digest rather than `!=` so the comparison cannot leak the shared
+    secret a byte at a time to a caller who can time the response.
+    """
+    auth = request.headers.get("authorization") or ""
+    return hmac.compare_digest(auth, f"Bearer {secret}")
+
+
 @app.get("/api/cron/sync")
-async def cron_sync(request: Request):
+async def cron_sync(request: Request, merge_only: bool = Query(False)):
     """Vercel cron endpoint. Syncs 1 workout per invocation."""
     from fastapi.responses import JSONResponse
 
     # Vercel sets CRON_SECRET to verify cron requests
     cron_secret = os.environ.get("CRON_SECRET")
     if cron_secret:
-        auth = request.headers.get("authorization")
-        if auth != f"Bearer {cron_secret}":
+        if not _bearer_ok(request, cron_secret):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-    if is_demo_mode():
-        return JSONResponse({"status": "demo", "message": "Sync disabled in demo mode"})
+    # Cron/autosync — respect grace so watch activities can land first.
+    return await _sync_one_recorded(respect_grace=True, merge_only=merge_only, trigger="cron")
 
-    if not _acquire_sync_lock():
-        return JSONResponse({"error": "Sync already running", "busy": True})
 
-    try:
-        # Cron/autosync — respect grace so watch activities can land first.
-        return await _do_sync_one(request, respect_grace=True)
-    finally:
-        _sync_executing.release()
+# ── Hevy webhook receiver ────────────────────────────────────────────────────
+# Hevy fires this when a workout is saved. The paired watch activity usually
+# reaches Garmin Connect a few minutes later, so the sync is staged: wait,
+# then try merge-only, and only the final attempt falls back to a plain FIT
+# upload — so a workout is never left unsynced. Retry state is in-memory
+# only; a restart drops it and auto-sync is the safety net.
+WEBHOOK_DELAY_SECONDS = int(os.environ.get("WEBHOOK_DELAY_SECONDS", "300"))
+WEBHOOK_RETRY_INTERVAL_SECONDS = int(os.environ.get("WEBHOOK_RETRY_INTERVAL_SECONDS", "600"))
+WEBHOOK_MAX_ATTEMPTS = int(os.environ.get("WEBHOOK_MAX_ATTEMPTS", "3"))
+# Ceiling on concurrently staged syncs; a burst past this is declined, not queued.
+WEBHOOK_MAX_INFLIGHT = int(os.environ.get("WEBHOOK_MAX_INFLIGHT", "4"))
+
+_webhook_tasks: set = set()  # strong refs — bare asyncio tasks get garbage collected
+
+
+def _can_run_background_work() -> bool:
+    """Whether work scheduled now will still run after the response is sent.
+
+    False on serverless, where the function is frozen or torn down as soon as
+    it responds: an asyncio task created here would simply never be resumed.
+    Python on Vercel has no `waitUntil` equivalent to hand the work to.
+    """
+    return not os.environ.get("VERCEL")
+
+
+async def _webhook_sync() -> None:
+    """Background worker behind /api/cron/webhook."""
+    import asyncio
+    import json
+
+    await asyncio.sleep(WEBHOOK_DELAY_SECONDS)
+    for attempt in range(1, WEBHOOK_MAX_ATTEMPTS + 1):
+        is_last = attempt == WEBHOOK_MAX_ATTEMPTS
+        try:
+            resp = await _sync_one_recorded(merge_only=not is_last, trigger="webhook")
+            data = json.loads(bytes(resp.body))
+        except Exception as e:
+            logger.error("Webhook sync attempt %d/%d failed: %s",
+                         attempt, WEBHOOK_MAX_ATTEMPTS, str(e)[:300])
+            return
+        # A lock collision with auto-sync is not an answer — retry, don't give up.
+        retry = bool(data.get("busy")) or bool(data.get("merge_pending"))
+        if not retry:
+            logger.info(
+                "Webhook sync attempt %d/%d: %s",
+                attempt,
+                WEBHOOK_MAX_ATTEMPTS,
+                f"synced '{data.get('title', '?')}'" if data.get("synced") else "nothing pending",
+            )
+            return
+        if not is_last:
+            await asyncio.sleep(WEBHOOK_RETRY_INTERVAL_SECONDS)
+    logger.warning(
+        "Webhook sync: workout still pending after %d attempts — auto-sync will retry",
+        WEBHOOK_MAX_ATTEMPTS,
+    )
+
+
+async def _webhook_sync_serverless():
+    """Handle the webhook without background work, for serverless deployments.
+
+    There is no "later" here: the process stops at the response, so the staged
+    retry cannot run. What is safe to do instead depends on the watch merge:
+
+    - Merge on (the default): the watch activity has almost certainly not
+      reached Garmin Connect yet. Uploading now produces exactly the duplicate
+      the merge exists to prevent, and there is no second attempt to wait for,
+      so hand the workout to the platform cron and only say so.
+    - Merge off: nothing is being waited for, so sync immediately — which is
+      the whole point of a webhook, and a large win over a daily cron.
+    """
+    from fastapi.responses import JSONResponse
+
+    if load_config().get("merge_mode", True):
+        logger.info(
+            "Hevy webhook received on a serverless deployment with the watch merge on — "
+            "leaving it to the scheduled sync so the watch activity can land first"
+        )
+        return JSONResponse({"status": "deferred", "reason": "no background work; cron will sync"})
+
+    logger.info("Hevy webhook received — syncing now (watch merge off, nothing to wait for)")
+    return await _sync_one_recorded(respect_grace=False, trigger="webhook")
+
+
+@app.post("/api/cron/webhook")
+async def cron_webhook(request: Request):
+    """Hevy webhook endpoint, fired when a workout is saved.
+
+    Hevy expects a 200 within a few seconds, so on a long-running deployment
+    this only checks the Bearer token and schedules the staged sync in the
+    background. Serverless has no background to schedule into — see
+    _webhook_sync_serverless.
+    """
+    import asyncio
+
+    from fastapi.responses import JSONResponse
+
+    # Fail CLOSED. This endpoint is internet-facing by design and is exempt from
+    # the dashboard cookie/CSRF middleware, so treating "no secret set" as "no
+    # auth needed" leaves an anonymous sync trigger exposed on any instance
+    # whose owner set a dashboard password but read CRON_SECRET as a Vercel-only
+    # concern. Unconfigured means unavailable, not open.
+    cron_secret = os.environ.get("CRON_SECRET")
+    if not cron_secret:
+        logger.warning(
+            "Hevy webhook refused: CRON_SECRET is not set, so there is no way to authenticate "
+            "Hevy. Set CRON_SECRET to enable the endpoint."
+        )
+        return JSONResponse(
+            {"error": "Webhook not configured: CRON_SECRET is unset"}, status_code=503
+        )
+    if not _bearer_ok(request, cron_secret):
+        logger.warning("Hevy webhook rejected: bad or missing Authorization header")
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    if not _can_run_background_work():
+        return await _webhook_sync_serverless()
+
+    # Each accepted request owns a task for up to WEBHOOK_DELAY +
+    # (MAX_ATTEMPTS - 1) * RETRY_INTERVAL seconds (~25 min by default), so
+    # unbounded spawning lets a burst pile up tasks that only queue on the sync
+    # lock and hammer Garmin. Past the cap, decline to add another: those
+    # already staged plus auto-sync cover the work, and Hevy still gets a 200 so
+    # it does not retry into the same wall.
+    if len(_webhook_tasks) >= WEBHOOK_MAX_INFLIGHT:
+        logger.warning(
+            "Hevy webhook throttled: %d staged syncs already in flight — they and "
+            "auto-sync will pick this workout up",
+            len(_webhook_tasks),
+        )
+        return JSONResponse({"status": "throttled", "in_flight": len(_webhook_tasks)})
+
+    logger.info(
+        "Hevy webhook received — staged sync in %ds (up to %d attempts)",
+        WEBHOOK_DELAY_SECONDS,
+        WEBHOOK_MAX_ATTEMPTS,
+    )
+    task = asyncio.create_task(_webhook_sync())
+    _webhook_tasks.add(task)
+    task.add_done_callback(_webhook_tasks.discard)
+    return JSONResponse({"status": "accepted"})
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
     import uvicorn
-    logging.basicConfig(format="%(message)s", level=logging.INFO, force=True)
+    logging.basicConfig(
+        format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO, force=True,
+    )
     logger.info("Starting hevy2garmin dashboard at http://localhost:%d", port)
     uvicorn.run(app, host=host, port=port, log_level="warning")

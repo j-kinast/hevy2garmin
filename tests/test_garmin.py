@@ -137,6 +137,64 @@ class TestUploadFit:
         assert result == {"upload_id": "u1", "activity_id": 2}
         assert finder.call_args.kwargs["exclude_activity_ids"] == ["1"]
 
+    def test_import_result_echoing_an_excluded_id_is_rejected(self, tmp_path: Path) -> None:
+        """Garmin can answer an import with the id of a pre-existing duplicate.
+
+        Under the "replace" strategy the watch copy shares the workout's start
+        time, so Garmin may report it as the import "success" instead of
+        creating a new activity. Trusting that id makes the caller delete the
+        watch copy and then rename an activity that no longer exists (404).
+        The echoed id must be discarded and the start-time lookup used instead.
+        """
+        fit_path = tmp_path / "workout.fit"
+        fit_path.write_bytes(b"fit")
+        client = MagicMock()
+        client.upload_activity.return_value = {
+            "detailedImportResult": {
+                "uploadId": "u1",
+                "successes": [{"internalId": 1}],  # the watch copy we are about to delete
+            }
+        }
+
+        with patch("hevy2garmin.garmin._limiter") as limiter, patch(
+            "hevy2garmin.garmin.time.sleep"
+        ), patch(
+            "hevy2garmin.garmin.find_activity_by_start_time", return_value=2
+        ) as finder:
+            limiter.call.side_effect = lambda func, *args: func(*args)
+            result = upload_fit(
+                client,
+                fit_path,
+                workout_start="2026-04-01T20:00:00+00:00",
+                exclude_activity_ids=[1],
+            )
+
+        assert result["activity_id"] == 2
+        assert finder.called
+
+    def test_import_result_id_is_kept_when_not_excluded(self, tmp_path: Path) -> None:
+        """The normal path is untouched: a genuine new activity id is used as-is."""
+        fit_path = tmp_path / "workout.fit"
+        fit_path.write_bytes(b"fit")
+        client = MagicMock()
+        client.upload_activity.return_value = {
+            "detailedImportResult": {"uploadId": "u1", "successes": [{"internalId": 2}]}
+        }
+
+        with patch("hevy2garmin.garmin._limiter") as limiter, patch(
+            "hevy2garmin.garmin.find_activity_by_start_time"
+        ) as finder:
+            limiter.call.side_effect = lambda func, *args: func(*args)
+            result = upload_fit(
+                client,
+                fit_path,
+                workout_start="2026-04-01T20:00:00+00:00",
+                exclude_activity_ids=[1],
+            )
+
+        assert result == {"upload_id": "u1", "activity_id": 2}
+        assert not finder.called
+
 
 class TestGenerateDescription:
     def test_basic_description(self, sample_workout: dict) -> None:
@@ -243,3 +301,28 @@ class TestGenerateDescription:
         desc = generate_description(workout)
         assert "80.0kg" in desc
         assert "3.0km" in desc
+
+
+def test_list_workouts_raises_on_non_list_body():
+    """A 2xx response with a non-list body (an error envelope or shape drift) must
+    raise, not be read as an empty library. Reading it as ``[]`` would make routine
+    reconciliation flag every synced routine as deleted on Garmin."""
+    from hevy2garmin.garmin import list_workouts
+    client = MagicMock()
+    resp = MagicMock()
+    resp.json.return_value = {"error": "temporarily unavailable"}  # dict, not a list
+    client.client.request.return_value = resp
+    with patch("hevy2garmin.garmin.time.sleep"):
+        with pytest.raises(RuntimeError, match="not a list"):
+            list_workouts(client)
+
+
+def test_list_workouts_returns_well_formed_list():
+    """A well-formed list body passes through unchanged."""
+    from hevy2garmin.garmin import list_workouts
+    client = MagicMock()
+    resp = MagicMock()
+    resp.json.return_value = [{"workoutId": 1}, {"workoutId": 2}]
+    client.client.request.return_value = resp
+    with patch("hevy2garmin.garmin.time.sleep"):
+        assert list_workouts(client) == [{"workoutId": 1}, {"workoutId": 2}]
